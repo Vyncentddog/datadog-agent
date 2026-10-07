@@ -24,6 +24,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/security/resolvers"
 	"github.com/DataDog/datadog-agent/pkg/security/resolvers/cgroup"
 	cgroupModel "github.com/DataDog/datadog-agent/pkg/security/resolvers/cgroup/model"
+	"github.com/DataDog/datadog-agent/pkg/security/secl/containerutils"
 	"github.com/DataDog/datadog-agent/pkg/security/secl/model"
 	activity_tree "github.com/DataDog/datadog-agent/pkg/security/security_profile/activity_tree"
 	mtdt "github.com/DataDog/datadog-agent/pkg/security/security_profile/activity_tree/metadata"
@@ -332,4 +333,26 @@ func TestManagerV2_HandleSampleRefresh(t *testing.T) {
 		m.HandleSampleRefresh(3)
 		assert.False(t, cookieMap.Contains(uint64(3)))
 	})
+}
+
+// TestManagerV2_ProcessEventWithoutCWS verifies that without CWS, whatever the profile flags,
+// ProcessEvent returns before it records the cgroup or queues the event.
+func TestManagerV2_ProcessEventWithoutCWS(t *testing.T) {
+	m := &ManagerV2{
+		config: &config.Config{RuntimeSecurity: &config.RuntimeSecurityConfig{
+			SecurityProfileEnabled:      true,
+			SecurityProfileV2Enabled:    true,
+			SecurityProfileV2EventTypes: []model.EventType{model.ExecEventType},
+		}},
+		profilePendingEvents: make(map[containerutils.CGroupID]*pendingProfile),
+		resolvedCgroups:      make(map[containerutils.CGroupID]struct{}),
+	}
+
+	event := model.NewFakeEvent()
+	event.Type = uint32(model.ExecEventType)
+	event.ProcessContext.Process.ContainerContext.ContainerID = "container"
+	m.ProcessEvent(event)
+
+	assert.Empty(t, m.profilePendingEvents)
+	assert.Empty(t, m.resolvedCgroups)
 }
