@@ -1,0 +1,93 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2026-present Datadog, Inc.
+
+package highmemoryk8s
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"strconv"
+	"time"
+
+	hostnameinterface "github.com/DataDog/datadog-agent/comp/core/hostname/hostnameinterface/def"
+	log "github.com/DataDog/datadog-agent/comp/core/log/def"
+	metricsevaluator "github.com/DataDog/datadog-agent/comp/core/metricsevaluator/def"
+	storedef "github.com/DataDog/datadog-agent/comp/healthplatform/store/def"
+)
+
+const (
+	monitorName = "high_memory_k8s"
+	// Both gauges are recorded by the container checks for the Datadog Agent pods running on the node,
+	// see pkg/collector/corechecks/containers/agentperformance.
+	usageMetric = "agent_performance__memory_usage"
+	limitMetric = "agent_performance__memory_limit"
+
+	threshold = 0.9
+	window    = 5 * time.Minute
+)
+
+// NewMonitor returns the monitor that reports the high memory issue to store while the node Agent uses more than
+// 90% of its container memory limit on average over 5 minutes, and resolves it once usage goes back down.
+func NewMonitor(store storedef.Component, hostname hostnameinterface.Component, logger log.Component) metricsevaluator.Monitor {
+	return metricsevaluator.Monitor{
+		Name:     monitorName,
+		Metric:   usageMetric,
+		DivideBy: limitMetric,
+		// The cluster Agent and cluster checks runner pods on the node have their own series.
+		Tags:        map[string]string{"kind": "agent"},
+		Window:      window,
+		Aggregation: metricsevaluator.AggregationAvg,
+		Comparator:  metricsevaluator.ComparatorAbove,
+		Threshold:   threshold,
+		Callback: func(ev metricsevaluator.Event) {
+			onTransition(store, hostname, logger, ev)
+		},
+	}
+}
+
+// onTransition reports or resolves the high memory issue when the monitor changes state.
+func onTransition(store storedef.Component, hostname hostnameinterface.Component, logger log.Component, ev metricsevaluator.Event) {
+	switch ev.State {
+	case metricsevaluator.StateAlert:
+		if err := reportIssue(store, hostname, ev.Value); err != nil {
+			logger.Warnf("Error reporting agent health issue on high memory transition: %v", err)
+		}
+	case metricsevaluator.StateOK:
+		resolveIssue(store, hostname)
+	}
+}
+
+// reportIssue builds the high memory issue for the given usage ratio and reports it to store.
+func reportIssue(store storedef.Component, hostname hostnameinterface.Component, usage float64) error {
+	issue, err := HighMemoryK8sIssue{}.BuildIssue(map[string]string{
+		contextKeyUsagePercent:     strconv.FormatFloat(usage*100, 'f', 0, 64),
+		contextKeyThresholdPercent: strconv.FormatFloat(threshold*100, 'f', 0, 64),
+		contextKeyWindow:           strconv.Itoa(int(window.Minutes())) + " minutes",
+	})
+	if err != nil {
+		return err
+	}
+	// Path B reporters set the id themselves; the store rejects an empty one.
+	issue.Id = issueID(store, hostname)
+	return store.ReportIssue(issue)
+}
+
+// resolveIssue resolves the high memory issue. It is a no-op when the issue is not active.
+func resolveIssue(store storedef.Component, hostname hostnameinterface.Component) {
+	store.ResolveIssue(issueID(store, hostname))
+}
+
+// issueID scopes IssueID to the Agent's discriminator: the uid of the DaemonSet owning the Agent pod when
+// resolvable, else the hostname. All node Agents of a DaemonSet share one issue, since its remediation (the
+// DaemonSet memory limit) is shared.
+//
+// It is computed on every call rather than once, because the DaemonSet uid is resolved asynchronously after
+// startup: report and resolve must agree on the final value.
+func issueID(store storedef.Component, hostname hostnameinterface.Component) string {
+	h := fnv.New64a()
+	h.Write([]byte(store.IssueDiscriminator(hostname.GetSafe(context.Background()))))
+	return fmt.Sprintf("%s:%016x", IssueID, h.Sum64())
+}
