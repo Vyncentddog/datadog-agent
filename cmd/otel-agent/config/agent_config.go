@@ -35,6 +35,7 @@ import (
 	pkgconfigsetup "github.com/DataDog/datadog-agent/pkg/config/setup"
 	"github.com/DataDog/datadog-agent/pkg/config/setup/constants"
 	configutils "github.com/DataDog/datadog-agent/pkg/config/utils"
+	logtypes "github.com/DataDog/datadog-agent/pkg/util/log/types"
 )
 
 type logLevel int
@@ -155,13 +156,20 @@ func NewConfigComponent(ctx context.Context, ddCfg string, uris []string) (confi
 		return nil, err
 	}
 
+	// The log level is either a single level or a per-package level
+	// specification; both take the default level through the merge with the
+	// collector telemetry level below, where the most verbose setting wins.
 	activeLogLevel := critical
+	var levelRules *logtypes.LevelRules
 	if pkgconfig.IsConfigured("log_level") {
-		var ok bool
-		logLevel := strings.ToLower(pkgconfig.GetString("log_level"))
-		activeLogLevel, ok = logLevelMap[logLevel]
-		if !ok {
-			return nil, fmt.Errorf("invalid log level (%v) set in the Datadog Agent configuration", pkgconfig.GetString("log_level"))
+		logLevelValue := pkgconfig.GetString("log_level")
+		if lvl, ok := logLevelMap[strings.ToLower(logLevelValue)]; ok {
+			activeLogLevel = lvl
+		} else if rules, err := logtypes.ParseLevelRules(logLevelValue, "github.com/DataDog/datadog-agent"); err != nil {
+			return nil, fmt.Errorf("invalid log level (%v) set in the Datadog Agent configuration", logLevelValue)
+		} else {
+			levelRules = rules
+			activeLogLevel = logLevelMap[rules.DefaultLevel().String()]
 		}
 	}
 	// Set the right log level. The most verbose setting takes precedence.
@@ -182,8 +190,15 @@ func NewConfigComponent(ctx context.Context, ddCfg string, uris []string) (confi
 	if telemetryLogMapping < activeLogLevel {
 		activeLogLevel = telemetryLogMapping
 	}
-	fmt.Printf("setting log level to: %v\n", logLevelReverseMap[activeLogLevel])
-	pkgconfig.Set("log_level", logLevelReverseMap[activeLogLevel], pkgconfigmodel.SourceFile)
+	effectiveLogLevel := logLevelReverseMap[activeLogLevel]
+	// A per-package specification is kept unless its default level is less
+	// verbose than the collector telemetry level, which then replaces it
+	// just like it would a plain level.
+	if levelRules != nil && logLevelMap[levelRules.DefaultLevel().String()] <= telemetryLogMapping {
+		effectiveLogLevel = pkgconfig.GetString("log_level")
+	}
+	fmt.Printf("setting log level to: %v\n", effectiveLogLevel)
+	pkgconfig.Set("log_level", effectiveLogLevel, pkgconfigmodel.SourceFile)
 
 	// Standalone mode runs without a core Datadog Agent on the same host, so
 	// every client that would otherwise contact it over IPC (trace-agent
