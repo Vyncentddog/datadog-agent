@@ -89,6 +89,13 @@ func TestAggregate(t *testing.T) {
 			ok:          true,
 		},
 		{
+			name:        "delta with a reset in the middle of the window",
+			aggregation: metricsevaluator.AggregationDelta,
+			samples:     []sample{{100, true}, {1, true}, {150, true}},
+			value:       150,
+			ok:          true,
+		},
+		{
 			name:        "no sample has a value",
 			aggregation: metricsevaluator.AggregationMax,
 			samples:     []sample{{0, false}, {0, false}, {0, false}},

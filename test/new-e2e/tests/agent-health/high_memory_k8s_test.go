@@ -57,82 +57,82 @@ func TestHighMemoryK8sSuite(t *testing.T) {
 }
 
 // TestHighMemoryK8sIssueLifecycle verifies that holding the node Agent container above 90% of its memory limit is
-// reported to fakeintake as ACTIVE, and that releasing the memory reports it as RESOLVED.
+// reported to fakeintake as ACTIVE, and that releasing the memory reports it as RESOLVED. Both phases run in one
+// test body: resolution needs the issue the detection phase raised.
 //
 // Cross-restart persistence is tested separately in TestResilienceSuite.
 func (suite *highMemoryK8sSuite) TestHighMemoryK8sIssueLifecycle() {
+	t := suite.T()
 	fakeIntake := suite.Env().FakeIntake.Client()
 	pod := suite.nodeAgentPod()
 
 	// Leave the Agent container as provisioned so the test can be retried on the same infra.
-	suite.T().Cleanup(func() {
+	t.Cleanup(func() {
 		_, _, _ = suite.execInNodeAgent(pod, stopMemHogCommand)
 	})
 
-	suite.T().Run("IssueDetection", func(t *testing.T) {
-		_, stderr, err := suite.execInNodeAgent(pod, startMemHogCommand)
-		require.NoError(t, err, "failed to start the memory allocation: %s", stderr)
+	// Detection: allocate memory up to 93% of the Agent container limit.
+	_, stderr, err := suite.execInNodeAgent(pod, startMemHogCommand)
+	require.NoError(t, err, "failed to start the memory allocation: %s", stderr)
 
-		reached := assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			_, _, err := suite.execInNodeAgent(pod, "test -f "+memHogPIDFile)
-			assert.NoError(ct, err, "memory allocation has not reached its target yet")
-		}, 2*time.Minute, 5*time.Second, "memory allocation did not reach its target")
-		if !reached {
-			t.Fatalf("memory diagnostics: %s", suite.memHogDiagnostics(pod))
-		}
+	reached := assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		_, _, err := suite.execInNodeAgent(pod, "test -f "+memHogPIDFile)
+		assert.NoError(ct, err, "memory allocation has not reached its target yet")
+	}, 2*time.Minute, 5*time.Second, "memory allocation did not reach its target")
+	if !reached {
+		t.Fatalf("memory diagnostics: %s", suite.memHogDiagnostics(pod))
+	}
 
-		var issues []*healthplatform.Issue
-		detected := assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			payloads, err := fakeIntake.GetAgentHealth()
-			assert.NoError(ct, err)
-			issues = nil
-			for _, p := range payloads {
-				for _, iss := range findIssuesByPrefix(p, highMemoryK8sIssuePrefix) {
-					if iss.PersistedIssue != nil && iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_ACTIVE {
-						issues = append(issues, iss)
-					}
+	var issues []*healthplatform.Issue
+	detected := assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+		payloads, err := fakeIntake.GetAgentHealth()
+		assert.NoError(ct, err)
+		issues = nil
+		for _, p := range payloads {
+			for _, iss := range findIssuesByPrefix(p, highMemoryK8sIssuePrefix) {
+				if iss.PersistedIssue != nil && iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_ACTIVE {
+					issues = append(issues, iss)
 				}
 			}
-			assert.NotEmpty(ct, issues, "issue not found as ACTIVE in fakeintake")
-		}, highMemoryK8sDetectionTimeout, defaultIssuePollInterval, "issue not detected as ACTIVE in fakeintake")
-		if !detected {
-			t.Fatalf("memory diagnostics: %s", suite.memHogDiagnostics(pod))
 		}
+		assert.NotEmpty(ct, issues, "issue not found as ACTIVE in fakeintake")
+	}, highMemoryK8sDetectionTimeout, defaultIssuePollInterval, "issue not detected as ACTIVE in fakeintake")
+	if !detected {
+		t.Fatalf("memory diagnostics: %s", suite.memHogDiagnostics(pod))
+	}
 
-		require.NotEmpty(t, issues)
-		issue := issues[0]
-		assert.Equal(t, "High Memory K8s", issue.IssueName)
-		assert.Equal(t, "high_memory_k8s", issue.IssueType)
-		assert.Equal(t, "resources", issue.Category)
-		assert.Equal(t, "agent", issue.Source)
-		assert.Equal(t, "agent", issue.Location)
-		assert.Equal(t, healthplatform.IssueSeverity_ISSUE_SEVERITY_HIGH, issue.Severity)
-		assert.Contains(t, issue.Tags, "memory")
-		assert.Contains(t, issue.Tags, "kubernetes")
-		require.NotNil(t, issue.Remediation)
-		assert.NotEmpty(t, issue.Remediation.Summary)
-		assert.NotEmpty(t, issue.Remediation.Steps)
-	})
+	require.NotEmpty(t, issues)
+	issue := issues[0]
+	assert.Equal(t, "High Memory K8s", issue.IssueName)
+	assert.Equal(t, "high_memory_k8s", issue.IssueType)
+	assert.Equal(t, "resources", issue.Category)
+	assert.Equal(t, "agent", issue.Source)
+	assert.Equal(t, "agent", issue.Location)
+	assert.Equal(t, healthplatform.IssueSeverity_ISSUE_SEVERITY_HIGH, issue.Severity)
+	assert.Contains(t, issue.Tags, "memory")
+	assert.Contains(t, issue.Tags, "kubernetes")
+	require.NotNil(t, issue.Remediation)
+	assert.NotEmpty(t, issue.Remediation.Summary)
+	assert.NotEmpty(t, issue.Remediation.Steps)
 
-	suite.T().Run("Resolution", func(t *testing.T) {
-		_, stderr, err := suite.execInNodeAgent(pod, stopMemHogCommand)
-		require.NoError(t, err, "failed to release the memory allocation: %s", stderr)
-		require.NoError(t, fakeIntake.FlushServerAndResetAggregators())
+	// Resolution: release the memory.
+	_, stderr, err = suite.execInNodeAgent(pod, stopMemHogCommand)
+	require.NoError(t, err, "failed to release the memory allocation: %s", stderr)
+	require.NoError(t, fakeIntake.FlushServerAndResetAggregators())
 
-		require.EventuallyWithT(t, func(ct *assert.CollectT) {
-			payloads, err := fakeIntake.GetAgentHealth()
-			assert.NoError(ct, err)
-			var resolved bool
-			for _, p := range payloads {
-				for _, iss := range findIssuesByPrefix(p, highMemoryK8sIssuePrefix) {
-					if iss.PersistedIssue != nil && iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_RESOLVED {
-						resolved = true
-					}
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		payloads, err := fakeIntake.GetAgentHealth()
+		assert.NoError(ct, err)
+		var resolved bool
+		for _, p := range payloads {
+			for _, iss := range findIssuesByPrefix(p, highMemoryK8sIssuePrefix) {
+				if iss.PersistedIssue != nil && iss.PersistedIssue.State == healthplatform.IssueState_ISSUE_STATE_RESOLVED {
+					resolved = true
 				}
 			}
-			assert.True(ct, resolved, "issue not found as RESOLVED in fakeintake")
-		}, highMemoryK8sResolutionTimeout, defaultIssuePollInterval, "issue not resolved after releasing the memory")
-	})
+		}
+		assert.True(ct, resolved, "issue not found as RESOLVED in fakeintake")
+	}, highMemoryK8sResolutionTimeout, defaultIssuePollInterval, "issue not resolved after releasing the memory")
 }
 
 // nodeAgentPod returns the name of the node Agent pod. The kind cluster has a single node, so there is one.

@@ -56,7 +56,7 @@ func onTransition(store storedef.Component, hostname hostnameinterface.Component
 			logger.Warnf("Error reporting agent health issue on high memory transition: %v", err)
 		}
 	case metricsevaluator.StateOK:
-		resolveIssue(store, hostname)
+		resolveIssue(store)
 	}
 }
 
@@ -75,17 +75,21 @@ func reportIssue(store storedef.Component, hostname hostnameinterface.Component,
 	return store.ReportIssue(issue)
 }
 
-// resolveIssue resolves the high memory issue. It is a no-op when the issue is not active.
-func resolveIssue(store storedef.Component, hostname hostnameinterface.Component) {
-	store.ResolveIssue(issueID(store, hostname))
+// resolveIssue resolves every active high memory issue of this Agent's store. It resolves by issue name rather than
+// recomputing the id, because the discriminator may have changed since the issue was reported (hostname before the
+// DaemonSet uid is resolved, then the uid), and because an issue persisted by a previous run may carry an older id.
+// The store is local to this Agent, so this never resolves an issue reported by another node.
+func resolveIssue(store storedef.Component) {
+	for _, id := range store.GetActiveIssueIDsByIssueName(IssueName) {
+		store.ResolveIssue(id)
+	}
 }
 
 // issueID scopes IssueID to the Agent's discriminator: the uid of the DaemonSet owning the Agent pod when
 // resolvable, else the hostname. All node Agents of a DaemonSet share one issue, since its remediation (the
 // DaemonSet memory limit) is shared.
 //
-// It is computed on every call rather than once, because the DaemonSet uid is resolved asynchronously after
-// startup: report and resolve must agree on the final value.
+// It is computed on every report, so a report made after the DaemonSet uid is resolved uses it.
 func issueID(store storedef.Component, hostname hostnameinterface.Component) string {
 	h := fnv.New64a()
 	h.Write([]byte(store.IssueDiscriminator(hostname.GetSafe(context.Background()))))

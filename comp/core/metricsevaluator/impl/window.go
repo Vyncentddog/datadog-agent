@@ -77,12 +77,17 @@ func (ms *monitorState) aggregate() (float64, bool) {
 	case metricsevaluator.AggregationMin:
 		return slices.Min(values), true
 	case metricsevaluator.AggregationDelta:
-		first, last := values[0], values[len(values)-1]
-		if last < first {
-			// The counter was reset (telemetry.Component.Reset) within the window.
-			return last, true
+		// Sum the increase between consecutive samples. A decrease means the counter was reset
+		// (telemetry.Component.Reset) and restarted from zero, so the sample after it counts in full.
+		var delta float64
+		for i := 1; i < len(values); i++ {
+			if values[i] >= values[i-1] {
+				delta += values[i] - values[i-1]
+			} else {
+				delta += values[i]
+			}
 		}
-		return last - first, true
+		return delta, true
 	}
 	return 0, false
 }

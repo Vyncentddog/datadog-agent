@@ -23,7 +23,7 @@ const (
 	AggregationMax Aggregation = "max"
 	// AggregationMin is the lowest sample in the window. Suited for gauges.
 	AggregationMin Aggregation = "min"
-	// AggregationDelta is the last sample minus the first sample of the window. Suited for counters,
+	// AggregationDelta is the increase over the window, counting counter resets. Suited for counters,
 	// which are cumulative since the Agent started.
 	AggregationDelta Aggregation = "delta"
 )
