@@ -33,6 +33,7 @@ dd_agent_go_test(
     name = "phonehome_test",
     srcs = [
         "controller_test.go",
+        "http_stack_test.go",
         "source_test.go",
     ],
     data = glob(["testdata/**"]),
@@ -47,9 +48,11 @@ dd_agent_go_test(
         "//pkg/privateactionrunner/enrollment",
         "//pkg/privateactionrunner/opms",
         "//pkg/privateactionrunner/util",
+        "//pkg/proto/pbgo/core",
         "//pkg/proto/pbgo/procmgr",
         "@com_github_benbjohnson_clock//:clock",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_protobuf//proto",
     ],
 )
