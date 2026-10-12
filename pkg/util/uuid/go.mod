@@ -6,7 +6,7 @@ require (
 	github.com/DataDog/datadog-agent/pkg/util/cache v0.84.3-rc.1
 	github.com/DataDog/datadog-agent/pkg/util/log v0.84.3-rc.1
 	github.com/shirou/gopsutil/v4 v4.26.7
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
