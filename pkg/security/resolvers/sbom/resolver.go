@@ -60,6 +60,13 @@ const (
 	// hostRescanInterval is the period of the scans of the host packages, the
 	// default period of the host scans of the core agent.
 	hostRescanInterval = time.Hour
+	// settleDelay is how long the open of a host file waits before it counts
+	// as usage. rpm opens each executable it removes or replaces, to clear its
+	// file capabilities, right before it deletes the file or renames the new
+	// one over it.
+	settleDelay = time.Second
+	// maxOpened bounds the opens of host files waiting for settleDelay.
+	maxOpened = 4096
 )
 
 // pendingFileEvent holds the minimal information needed to re-process a file
@@ -69,6 +76,16 @@ const (
 type pendingFileEvent struct {
 	suidBit        bool
 	accessedByRoot bool
+}
+
+// openedFile is an open of a host file waiting for settleDelay, with the
+// fields of the opening process that usage reads.
+type openedFile struct {
+	pid  uint32
+	cred model.Credentials
+	comm string
+	file model.FileEvent
+	at   time.Time
 }
 
 var errNoProcessForContainerID = errors.New("found no running process matching the given container ID")
@@ -275,6 +292,7 @@ type Resolver struct {
 
 	statsdClient   statsd.ClientInterface
 	sbomCollector  sbomCollector
+	hostRoot       string
 	hostRootDevice uint64
 	hostRootInode  uint64
 	hostSBOM       *SBOM
@@ -284,6 +302,10 @@ type Resolver struct {
 	hostScanLock sync.Mutex
 	// walkProcesses calls its argument on every process the probe knows of.
 	walkProcesses func(func(*model.ProcessCacheEntry))
+	// openedLock guards opened, the opens of host files waiting for
+	// settleDelay, oldest first.
+	openedLock sync.Mutex
+	opened     []openedFile
 
 	sbomGenerations       *atomic.Uint64
 	failedSBOMGenerations *atomic.Uint64
@@ -331,6 +353,7 @@ func NewSBOMResolver(c *config.RuntimeSecurityConfig, statsdClient statsd.Client
 		dataCache:             dataCache,
 		scanChan:              make(chan *SBOM, 100),
 		sbomCollector:         sbomCollector,
+		hostRoot:              hostProcRootPath,
 		hostRootDevice:        stat.Dev,
 		hostRootInode:         stat.Ino,
 		sbomGenerations:       atomic.NewUint64(0),
@@ -369,6 +392,12 @@ func (r *Resolver) Start(ctx context.Context) error {
 		go func() {
 			defer rescan.Stop()
 			r.rescanHost(ctx, rescan.C)
+		}()
+
+		settle := time.NewTicker(settleDelay / 2)
+		go func() {
+			defer settle.Stop()
+			r.settleOpens(ctx, settle.C)
 		}()
 	}
 
@@ -775,6 +804,21 @@ func (r *Resolver) onHostRoot(pid uint32) bool {
 	return stat.Dev == r.hostRootDevice && stat.Ino == r.hostRootInode
 }
 
+// replaced reports whether the host file of an event is gone from its path, or
+// replaced there by another file. A file of unknown path or inode counts as in
+// place, and so does an overlayfs file, whose event carries the inode of the
+// layer it comes from, which can differ from the inode stat reports.
+func (r *Resolver) replaced(file *model.FileEvent) bool {
+	if !file.IsPathnameStrResolved || file.Inode == 0 || file.IsInLowerLayer() || file.IsInUpperLayer() {
+		return false
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Lstat(r.hostRoot+file.PathnameStr, &stat); err != nil {
+		return errors.Is(err, fs.ErrNotExist)
+	}
+	return stat.Ino != file.Inode
+}
+
 // isDir reports whether mode, the mode of the file of an event, is that of a
 // directory.
 func isDir(mode uint16) bool {
@@ -1070,6 +1114,66 @@ func (r *Resolver) owner(sbom *SBOM, pid uint32, path string) *sbomtypes.Package
 		return nil
 	}
 	return pkg
+}
+
+// ResolveOpen records the open of file by the process of pc as usage of the
+// package that owns it, as ResolvePackage does. The open of a host package
+// file counts once it has waited settleDelay, and only if the file is still at
+// its path then.
+func (r *Resolver) ResolveOpen(pc *model.ProcessContext, file *model.FileEvent) {
+	if pc.ContainerContext.ContainerID != "" {
+		r.ResolvePackage(pc, file)
+		return
+	}
+	// LookupPackage reads the root of the process while the process lives.
+	if isDir(file.Mode) || r.LookupPackage(pc, file) == nil {
+		return
+	}
+
+	r.openedLock.Lock()
+	if len(r.opened) == maxOpened {
+		r.openedLock.Unlock()
+		r.ResolvePackage(pc, file)
+		return
+	}
+	r.opened = append(r.opened, openedFile{pid: pc.Pid, cred: pc.Credentials, comm: pc.Comm, file: *file, at: time.Now()})
+	r.openedLock.Unlock()
+}
+
+// settleOpens records the opens of host files that have waited settleDelay,
+// on every tick until ctx is done.
+func (r *Resolver) settleOpens(ctx context.Context, tick <-chan time.Time) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-tick:
+			r.recordSettled(now)
+		}
+	}
+}
+
+// recordSettled records as usage the opens of host files that have waited
+// settleDelay by now, those whose files are still at their paths.
+func (r *Resolver) recordSettled(now time.Time) {
+	r.openedLock.Lock()
+	n := 0
+	for n < len(r.opened) && now.Sub(r.opened[n].at) >= settleDelay {
+		n++
+	}
+	settled := slices.Clone(r.opened[:n])
+	r.opened = slices.Delete(r.opened, 0, n)
+	r.openedLock.Unlock()
+
+	for i := range settled {
+		o := &settled[i]
+		if r.replaced(&o.file) {
+			continue
+		}
+		var pc model.ProcessContext
+		pc.Pid, pc.Credentials, pc.Comm = o.pid, o.cred, o.comm
+		r.ResolvePackage(&pc, &o.file)
+	}
 }
 
 // queuePendingFileEvent stores a file access that arrived before the SBOM for the
