@@ -94,7 +94,11 @@ func TestSecurityProfileV2Mounts(t *testing.T) {
 				return
 			}
 			for _, mn := range prof.ActivityTree.Mounts {
-				assert.True(c, mn.InBaseNamespace, "expected mount %q to be flagged in the base namespace", mn.MountPoint)
+				base := false
+				mn.EachSeen(func(_ uint64, _, _ int64, baseNamespace bool) {
+					base = base || baseNamespace
+				})
+				assert.True(c, base, "expected mount %q to be flagged in the base namespace", mn.MountPoint)
 			}
 		}, 30*time.Second, 500*time.Millisecond)
 	})

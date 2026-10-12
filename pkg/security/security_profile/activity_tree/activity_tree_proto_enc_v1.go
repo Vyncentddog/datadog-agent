@@ -39,12 +39,11 @@ func MountsToProto(at *ActivityTree) []*adproto.MountNode {
 	out := make([]*adproto.MountNode, 0, len(at.Mounts))
 	for _, mn := range at.Mounts {
 		out = append(out, &adproto.MountNode{
-			NodeBase:      nodeBaseToProto(&mn.NodeBase, at.GetTagFromID),
-			MountPoint:    mn.MountPoint,
-			MountRoot:     mn.MountRoot,
-			Filesystem:    mn.Filesystem,
-			MountFlags:    mn.MountFlags,
-			BaseNamespace: mn.InBaseNamespace,
+			NodeBase:   nodeBaseToProto(&mn.NodeBase, at.GetTagFromID),
+			MountPoint: mn.MountPoint,
+			MountRoot:  mn.MountRoot,
+			Filesystem: mn.Filesystem,
+			MountFlags: mn.MountFlags,
 		})
 	}
 	return out
@@ -524,7 +523,7 @@ func nodeBaseToProto(nb *NodeBase, tagIDToImageTag func(id uint64) string) *adpr
 		Seen: make(map[string]*adproto.ImageTagTimes, nb.SeenLen()),
 	}
 
-	nb.EachSeen(func(id uint64, firstSeen, lastSeen int64) {
+	nb.EachSeen(func(id uint64, firstSeen, lastSeen int64, baseNamespace bool) {
 		tag := tagIDToImageTag(id)
 		if tag == "" {
 			// ID is stale (slot was freed before this node was evicted); skip to avoid
@@ -532,8 +531,9 @@ func nodeBaseToProto(nb *NodeBase, tagIDToImageTag func(id uint64) string) *adpr
 			return
 		}
 		pnb.Seen[tag] = &adproto.ImageTagTimes{
-			FirstSeen: uint64(firstSeen),
-			LastSeen:  uint64(lastSeen),
+			FirstSeen:     uint64(firstSeen),
+			LastSeen:      uint64(lastSeen),
+			BaseNamespace: baseNamespace,
 		}
 	})
 

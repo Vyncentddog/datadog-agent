@@ -13,9 +13,10 @@ import (
 )
 
 type seenEntry struct {
-	id        uint64
-	firstSeen int64
-	lastSeen  int64
+	id            uint64
+	firstSeen     int64
+	lastSeen      int64
+	baseNamespace bool
 }
 
 func timeToNanos(t time.Time) int64 {
@@ -133,10 +134,35 @@ func (b *NodeBase) GetSeenTimes(imageTagID uint64) (firstSeen, lastSeen int64, f
 	return 0, 0, false
 }
 
-// EachSeen calls fn for every recorded image tag ID and its first/last seen timestamps
-// (unix nanoseconds, 0 = unset).
-func (b *NodeBase) EachSeen(fn func(id uint64, firstSeen, lastSeen int64)) {
+// SetBaseNamespace marks imageTagID as having seen this node in the workload's base mount
+// namespace. ID 0 is the null sentinel and is a no-op.
+func (b *NodeBase) SetBaseNamespace(imageTagID uint64) {
+	if imageTagID == 0 {
+		return
+	}
+	for i, entry := range b.seen {
+		if entry.id == imageTagID {
+			b.seen[i].baseNamespace = true
+			return
+		}
+	}
+}
+
+// GetBaseNamespace reports whether imageTagID saw this node in the workload's base mount
+// namespace.
+func (b *NodeBase) GetBaseNamespace(imageTagID uint64) bool {
 	for _, entry := range b.seen {
-		fn(entry.id, entry.firstSeen, entry.lastSeen)
+		if entry.id == imageTagID {
+			return entry.baseNamespace
+		}
+	}
+	return false
+}
+
+// EachSeen calls fn for every recorded image tag ID with its first/last seen timestamps
+// (unix nanoseconds, 0 = unset) and its base-namespace membership.
+func (b *NodeBase) EachSeen(fn func(id uint64, firstSeen, lastSeen int64, baseNamespace bool)) {
+	for _, entry := range b.seen {
+		fn(entry.id, entry.firstSeen, entry.lastSeen, entry.baseNamespace)
 	}
 }

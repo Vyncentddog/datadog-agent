@@ -29,8 +29,6 @@ type MountNode struct {
 	MountRoot  string
 	Filesystem string
 	MountFlags uint32
-
-	InBaseNamespace bool
 }
 
 func (mn *MountNode) size() int64 {
@@ -61,29 +59,52 @@ func (at *ActivityTree) indexMount(key mountNodeKey, node *MountNode) {
 	at.mountIndex[key] = node
 }
 
-func (at *ActivityTree) AddBaseMountNamespaceID(nsID uint32) {
-	if nsID == 0 {
+// AddBaseMountNamespaceID records nsID as a base mount namespace for imageTagID. Base-namespace
+// membership is tracked per image tag because a mount can belong to the base namespace in one
+// workload version and not in another.
+func (at *ActivityTree) AddBaseMountNamespaceID(imageTagID uint64, nsID uint32) {
+	if nsID == 0 || imageTagID == 0 {
 		return
 	}
 	if at.baseMountNamespaceIDs == nil {
-		at.baseMountNamespaceIDs = make(map[uint32]int)
+		at.baseMountNamespaceIDs = make(map[uint64]map[uint32]int)
 	}
-	at.baseMountNamespaceIDs[nsID]++
+	ids := at.baseMountNamespaceIDs[imageTagID]
+	if ids == nil {
+		ids = make(map[uint32]int)
+		at.baseMountNamespaceIDs[imageTagID] = ids
+	}
+	ids[nsID]++
 }
 
-func (at *ActivityTree) RemoveBaseMountNamespaceID(nsID uint32) {
-	if nsID == 0 || at.baseMountNamespaceIDs == nil {
+// RemoveBaseMountNamespaceID drops a reference to nsID as a base mount namespace for imageTagID.
+func (at *ActivityTree) RemoveBaseMountNamespaceID(imageTagID uint64, nsID uint32) {
+	if nsID == 0 || imageTagID == 0 || at.baseMountNamespaceIDs == nil {
 		return
 	}
-	if at.baseMountNamespaceIDs[nsID] <= 1 {
-		delete(at.baseMountNamespaceIDs, nsID)
+	ids := at.baseMountNamespaceIDs[imageTagID]
+	if ids == nil {
 		return
 	}
-	at.baseMountNamespaceIDs[nsID]--
+	if ids[nsID] <= 1 {
+		delete(ids, nsID)
+		if len(ids) == 0 {
+			delete(at.baseMountNamespaceIDs, imageTagID)
+		}
+		return
+	}
+	ids[nsID]--
+}
+
+func (at *ActivityTree) isBaseMountNamespace(imageTagID uint64, nsID uint32) bool {
+	if nsID == 0 || imageTagID == 0 {
+		return false
+	}
+	return at.baseMountNamespaceIDs[imageTagID][nsID] > 0
 }
 
 func (at *ActivityTree) InsertMount(nsID uint32, mountPoint, mountRoot, filesystem string, mountFlags uint32, imageTagID uint64, generationType NodeGenerationType, timestamp time.Time, dryRun bool) bool {
-	isBase := nsID != 0 && at.baseMountNamespaceIDs[nsID] > 0
+	isBase := at.isBaseMountNamespace(imageTagID, nsID)
 
 	key := mountNodeKey{mountPoint: mountPoint, filesystem: filesystem, mountFlags: mountFlags}
 	if mn, ok := at.mountIndex[key]; ok {
@@ -91,7 +112,7 @@ func (at *ActivityTree) InsertMount(nsID uint32, mountPoint, mountRoot, filesyst
 			mn.MountRoot = mountRoot
 			mn.AppendImageTagID(imageTagID, timestamp)
 			if isBase {
-				mn.InBaseNamespace = true
+				mn.SetBaseNamespace(imageTagID)
 			}
 		}
 		return false
@@ -102,7 +123,9 @@ func (at *ActivityTree) InsertMount(nsID uint32, mountPoint, mountRoot, filesyst
 	}
 
 	node := NewMountNode(mountPoint, mountRoot, filesystem, mountFlags, generationType, imageTagID, timestamp)
-	node.InBaseNamespace = isBase
+	if isBase {
+		node.SetBaseNamespace(imageTagID)
+	}
 	at.indexMount(key, node)
 	at.Stats.SizeBytes += node.size()
 	return true

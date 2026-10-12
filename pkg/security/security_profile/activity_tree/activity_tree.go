@@ -198,7 +198,7 @@ type ActivityTree struct {
 	Mounts     []*MountNode
 	mountIndex map[mountNodeKey]*MountNode
 
-	baseMountNamespaceIDs map[uint32]int
+	baseMountNamespaceIDs map[uint64]map[uint32]int
 
 	imageTagIDs []imageTagEntry
 }
@@ -225,7 +225,7 @@ func NewActivityTree(validator Owner, pathsReducer *PathsReducer, treeType strin
 		CookieToProcessNode:   cache,
 		SyscallsMask:          make(map[int]int),
 		DNSNames:              utils.NewStringKeys(nil),
-		baseMountNamespaceIDs: make(map[uint32]int),
+		baseMountNamespaceIDs: make(map[uint64]map[uint32]int),
 		mountIndex:            make(map[mountNodeKey]*MountNode),
 	}
 }
@@ -1279,7 +1279,7 @@ func (at *ActivityTree) SyscallsByImageTagID() map[uint64][]uint32 {
 				continue
 			}
 			syscall := uint32(syscallNode.Syscall)
-			syscallNode.EachSeen(func(imageTagID uint64, _, _ int64) {
+			syscallNode.EachSeen(func(imageTagID uint64, _, _ int64, _ bool) {
 				set, ok := sets[imageTagID]
 				if !ok {
 					set = make(map[uint32]struct{})
