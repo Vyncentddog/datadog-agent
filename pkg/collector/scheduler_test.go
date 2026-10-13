@@ -231,7 +231,7 @@ func TestGetChecksFromConfigsRegistersPythonShadowCallbackRouteAndCleansUp(t *te
 	s := CheckScheduler{
 		configToChecks:      make(map[string][]checkid.ID),
 		senderManager:       normalSenderManager,
-		infraTagger:         infratags.NewTagger(cfg),
+		infraTagger:         infratags.NewMetricTagger(cfg),
 		shadowSenderManager: shadowSenderManager,
 	}
 	s.addLoader(loader)
