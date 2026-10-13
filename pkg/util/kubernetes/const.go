@@ -34,6 +34,14 @@ const (
 	KubeAppManagedByLabelKey = "app.kubernetes.io/managed-by"
 	// DynamoGraphDeploymentNameLabelKey is the Dynamo operator's label for the owning graph deployment
 	DynamoGraphDeploymentNameLabelKey = "nvidia.com/dynamo-graph-deployment-name"
+	// RayClusterLabelKey is the KubeRay label for the owning RayCluster.
+	RayClusterLabelKey = "ray.io/cluster"
+	// RayServeLabelKey selects Ray pods for the serving service.
+	RayServeLabelKey = "ray.io/serve"
+	// RayNodeTypeLabelKey is the KubeRay label for the head or worker node type.
+	RayNodeTypeLabelKey = "ray.io/node-type"
+	// RayNodeGroupLabelKey is the KubeRay label for the worker group.
+	RayNodeGroupLabelKey = "ray.io/group"
 	// KueueQueueNameLabelKey is the queue selection label key used by Kueue-managed workloads
 	KueueQueueNameLabelKey = "kueue.x-k8s.io/queue-name"
 	// KueueLocalQueueNameLabelKey is the pod label key set by Kueue with the admitted local queue name
