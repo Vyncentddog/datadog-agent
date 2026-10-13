@@ -394,6 +394,19 @@ func TestConfigHostname(t *testing.T) {
 				// Copy out of runfiles: Windows file junctions cannot be exec'd, and
 				// callers os.Remove the returned path.
 				dst := filepath.Join(t.TempDir(), filepath.Base(src))
+				// On Windows, runfiles could be either actual copied files or junctions.
+				// Junctions pointing to files cannot be read directly and need to be resolved.
+				// If the file is not a plainfile, assume it's a junction and use Readlink to get
+				// to the actual file.
+				if runtime.GOOS == "windows" {
+					info, err := os.Lstat(src)
+					require.NoError(t, err, "failed to lstat %q", src)
+					if !info.Mode().IsRegular() {
+						src, err = os.Readlink(src)
+						require.NoError(t, err, "failed to resolve symlinks for %q", src)
+					}
+				}
+
 				data, err := os.ReadFile(src)
 				if err != nil {
 					t.Fatal(err)
