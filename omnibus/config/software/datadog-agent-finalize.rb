@@ -60,6 +60,51 @@ build do
             delete "#{install_dir}/embedded/lib/dbus-1.0/include"
         end
 
+        # Windows counterpart of the size cleanups above. The embedded Python
+        # (embedded3) is compressed into embedded3.COMPRESSED when building the
+        # MSI, and shipped expanded in the zip packages: everything removed here
+        # is neither used by the agent at runtime nor by the MSI custom actions at
+        # install time (they only need python.exe and, for the FIPS flavor,
+        # openssl.exe/ssl).
+        #
+        # Note on include/ and libs/ specifically: unlike on Linux, where
+        # customers can build custom Python checks against the embedded
+        # toolchain, nothing on a Windows machine can compile against embedded3
+        # (that would require MSVC), and the only in-build consumer (the FIPS
+        # cryptography rebuild in datadog-agent-integrations-py3) runs before
+        # this software definition, which is the last of the project. They are
+        # therefore dropped entirely here.
+        if windows_target?
+            emb3 = File.join(install_dir, "embedded3")
+
+            # pywin32 bundles its full HTML documentation (~2.5MB), never needed at runtime
+            delete File.join(emb3, "Lib", "site-packages", "PyWin32.chm")
+
+            # pip is already installed in site-packages; ensurepip (including its
+            # bundled pip wheel, ~1.8MB) is only useful to bootstrap pip on a bare
+            # interpreter. The agent always uses `python -m pip`.
+            delete File.join(emb3, "Lib", "ensurepip")
+
+            # Console-script wrappers (~105KB each, ~4MB total) for the embedded
+            # Python packages (supervisord, rethinkdb, in-toto, ddtrace-run,
+            # pywin32_postinstall, pip...). Nothing invokes them: the MSI uses
+            # `python -m pip`, and ddtrace resolves its crashtracker receiver
+            # through the ddtrace.commands module and re-executes python.exe.
+            delete File.join(emb3, "Scripts")
+
+            # C headers and import libraries, only needed to compile against
+            # the embedded Python, see the note above. (~2.3 MiB)
+            delete File.join(emb3, "include")
+            delete File.join(emb3, "libs")
+
+            # Unit tests bundled with the embedded packages (pywin32, adodbapi,
+            # isapi, openstack, ...), mirroring the site-packages tests cleanup
+            # done above for Linux.
+            Dir.glob(File.join(emb3, "Lib", "site-packages", "**", "{test,tests}")).each do |dir|
+                delete dir if File.directory?(dir)
+            end
+        end
+
         # TODO: Rather than move these, let's install them to the right place to start
         if linux_target?
             # Move configuration files
