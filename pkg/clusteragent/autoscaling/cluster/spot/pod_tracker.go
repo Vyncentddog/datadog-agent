@@ -23,15 +23,21 @@ type pendingSpotPod struct {
 	createdAt     time.Time
 }
 
-// ownerPodSet tracks spot and on-demand pods and in-flight admission counts for a single direct owner.
+// ownerPodSet tracks spot and on-demand pods and in-flight admissions for a single direct owner.
 type ownerPodSet struct {
 	config     workloadSpotConfig
 	lastUpdate time.Time
 
-	spotUIDs               map[string]podInfo
-	onDemandUIDs           map[string]podInfo
-	admissionSpotCount     int
-	admissionOnDemandCount int
+	spotUIDs     map[string]podInfo
+	onDemandUIDs map[string]podInfo
+
+	// In-flight admissions are pods admitted by the webhook that are not tracked yet, ordered by time, oldest first.
+	// Normally an admission is released when the pod appears in a workloadmeta pod update event.
+	// The webhook does not learn whether the create succeeded, so an admission that never becomes a pod
+	// (e.g. the create is rejected after admission) would stay in-flight forever and skew the placement
+	// decisions. Admissions expire after admissionTTL to prevent that.
+	admissionsSpot     []time.Time
+	admissionsOnDemand []time.Time
 }
 
 // podInfo holds pod metadata.
@@ -53,17 +59,20 @@ type podTracker struct {
 	defaultConfig workloadSpotConfig
 	configSource  func(objectRef) (workloadSpotConfig, bool)
 	telemetry     *telemetry
+	admissionTTL  time.Duration
 
 	mu              sync.RWMutex
 	podSets         map[objectRef]map[objectRef]*ownerPodSet
 	pendingSpotPods map[string]pendingSpotPod
 }
 
-func newPodTracker(defaultConfig workloadSpotConfig, configSource func(objectRef) (workloadSpotConfig, bool), tel *telemetry) *podTracker {
+// newPodTracker creates a podTracker. In-flight admissions that do not become a pod expire after admissionTTL.
+func newPodTracker(defaultConfig workloadSpotConfig, configSource func(objectRef) (workloadSpotConfig, bool), tel *telemetry, admissionTTL time.Duration) *podTracker {
 	return &podTracker{
 		defaultConfig:   defaultConfig,
 		configSource:    configSource,
 		telemetry:       tel,
+		admissionTTL:    admissionTTL,
 		podSets:         make(map[objectRef]map[objectRef]*ownerPodSet),
 		pendingSpotPods: make(map[string]pendingSpotPod),
 	}
@@ -183,7 +192,7 @@ func (t *podTracker) deletePod(o podOwnership, uid string) {
 func (t *podTracker) deletePodLocked(o podOwnership, uid string) {
 	if owners, ok := t.podSets[o.topLevelOwner]; ok {
 		if ps, ok := owners[o.directOwner]; ok {
-			if ps.delete(uid, time.Now()) {
+			if ps.delete(uid, time.Now(), t.admissionTTL) {
 				delete(owners, o.directOwner)
 			}
 		}
@@ -197,6 +206,7 @@ func (t *podTracker) deletePodLocked(o podOwnership, uid string) {
 
 // getPodSetLocked returns the ownerPodSet for the given ownership, creating it if absent,
 // and always applies the latest config from configSource to the returned pod set.
+// It drops expired in-flight admissions of an existing pod set.
 // When configSource has no entry for the top-level owner it removes
 // tracking state for the owner and returns (nil, false).
 // Must be called with t.mu held.
@@ -217,6 +227,8 @@ func (t *podTracker) getPodSetLocked(o podOwnership) (*ownerPodSet, bool) {
 	if !exists {
 		ps = t.newOwnerPodSet()
 		owners[o.directOwner] = ps
+	} else {
+		ps.expireAdmissions(t.admissionTTL)
 	}
 	ps.config = cfg
 	return ps, true
@@ -243,6 +255,9 @@ func (t *podTracker) getPodToDelete(rebalanceStabilizationPeriod time.Duration) 
 			ps.config = cfg
 			if ps.config.isDisabled(now) {
 				continue
+			}
+			if n := ps.expireAdmissions(t.admissionTTL); n > 0 {
+				log.Debugf("Expired %d in-flight admissions for %s that did not become pods", n, topLevel)
 			}
 			if uid, name, isSpot := ps.getPodToDelete(lastUpdatedBefore); uid != "" {
 				ps.lastUpdate = now // suppress re-selection until stabilization period elapses
@@ -325,30 +340,56 @@ func (t *podTracker) updateWorkloadMetricsLocked(topLevelOwner objectRef) {
 	t.telemetry.observeWorkload(snap)
 }
 
-// admit increments the in-flight admission count for the given spot/on-demand decision and returns isSpot.
+// admit records an in-flight admission for the given spot/on-demand decision and returns isSpot.
+// The admission time is taken here and the caller holds the tracker lock, so admissions stay ordered by time.
 func (ps *ownerPodSet) admit(isSpot bool) bool {
+	now := time.Now()
 	if isSpot {
-		ps.admissionSpotCount++
+		ps.admissionsSpot = append(ps.admissionsSpot, now)
 	} else {
-		ps.admissionOnDemandCount++
+		ps.admissionsOnDemand = append(ps.admissionsOnDemand, now)
 	}
 	return isSpot
 }
 
-// track upserts the pod UID with its info, decrementing the in-flight admission count on first appearance.
+// expireAdmissions drops in-flight admissions older than admissionTTL and returns how many it dropped.
+// Admissions are ordered by time so this only looks at the oldest ones, which keeps the admission webhook path cheap.
+func (ps *ownerPodSet) expireAdmissions(ttl time.Duration) int {
+	cutoff := time.Now().Add(-ttl)
+	var droppedSpot, droppedOnDemand int
+	ps.admissionsSpot, droppedSpot = deleteAdmissionsBefore(ps.admissionsSpot, cutoff)
+	ps.admissionsOnDemand, droppedOnDemand = deleteAdmissionsBefore(ps.admissionsOnDemand, cutoff)
+	return droppedSpot + droppedOnDemand
+}
+
+// deleteAdmissionsBefore deletes admissions made before the cutoff from the front of the time-ordered list.
+func deleteAdmissionsBefore(admissions []time.Time, cutoff time.Time) ([]time.Time, int) {
+	n := 0
+	for n < len(admissions) && admissions[n].Before(cutoff) {
+		n++
+	}
+	return deleteAdmissions(admissions, n), n
+}
+
+// deleteAdmissions deletes the first n admissions by reslicing in O(1), i.e. without shifting the rest.
+// It returns nil when no admissions are left.
+func deleteAdmissions(admissions []time.Time, n int) []time.Time {
+	if n >= len(admissions) {
+		return nil
+	}
+	return admissions[n:]
+}
+
+// track upserts the pod UID with its info, releasing the oldest in-flight admission on first appearance.
 func (ps *ownerPodSet) track(uid string, isSpot bool, info podInfo, now time.Time) {
 	if isSpot {
 		if _, exists := ps.spotUIDs[uid]; !exists {
-			if ps.admissionSpotCount > 0 {
-				ps.admissionSpotCount--
-			}
+			ps.admissionsSpot = deleteAdmissions(ps.admissionsSpot, 1)
 		}
 		ps.spotUIDs[uid] = info
 	} else {
 		if _, exists := ps.onDemandUIDs[uid]; !exists {
-			if ps.admissionOnDemandCount > 0 {
-				ps.admissionOnDemandCount--
-			}
+			ps.admissionsOnDemand = deleteAdmissions(ps.admissionsOnDemand, 1)
 		}
 		ps.onDemandUIDs[uid] = info
 	}
@@ -407,7 +448,7 @@ func (ps *ownerPodSet) excess() (excessSpot, excessOnDemand int) {
 
 // hasAdmissions returns true if pod set has admitted but not yet tracked pods.
 func (ps *ownerPodSet) hasAdmissions() bool {
-	return ps.admissionSpotCount > 0 || ps.admissionOnDemandCount > 0
+	return len(ps.admissionsSpot) > 0 || len(ps.admissionsOnDemand) > 0
 }
 
 // hasPending returns true if any tracked pod is in PodPending phase.
@@ -434,22 +475,24 @@ func pickPod(uids map[string]podInfo) (string, string) {
 	return "", ""
 }
 
-// delete removes pod by uid, updates lastUpdate, and returns true if it tracks no more pods including in-flight admissions.
-func (ps *ownerPodSet) delete(uid string, now time.Time) bool {
+// delete removes pod by uid, updates lastUpdate, drops in-flight admissions older than admissionTTL
+// and returns true if it tracks no more pods including in-flight admissions.
+func (ps *ownerPodSet) delete(uid string, now time.Time, admissionTTL time.Duration) bool {
 	delete(ps.spotUIDs, uid)
 	delete(ps.onDemandUIDs, uid)
 	ps.lastUpdate = now
-	return len(ps.spotUIDs) == 0 && len(ps.onDemandUIDs) == 0 && ps.admissionSpotCount == 0 && ps.admissionOnDemandCount == 0
+	ps.expireAdmissions(admissionTTL)
+	return len(ps.spotUIDs) == 0 && len(ps.onDemandUIDs) == 0 && !ps.hasAdmissions()
 }
 
 // totalCount returns the total number of pods including in-flight admissions.
 func (ps *ownerPodSet) totalCount() int {
-	return len(ps.spotUIDs) + len(ps.onDemandUIDs) + ps.admissionSpotCount + ps.admissionOnDemandCount
+	return len(ps.spotUIDs) + len(ps.onDemandUIDs) + len(ps.admissionsSpot) + len(ps.admissionsOnDemand)
 }
 
 // spotCount returns the number of spot-assigned pods including in-flight spot admissions.
 func (ps *ownerPodSet) spotCount() int {
-	return len(ps.spotUIDs) + ps.admissionSpotCount
+	return len(ps.spotUIDs) + len(ps.admissionsSpot)
 }
 
 func isSpotAssigned(pod *workloadmeta.KubernetesPod) bool {
