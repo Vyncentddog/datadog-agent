@@ -8,15 +8,21 @@
 package orchestrator
 
 import (
+	"errors"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8sdiscovery "k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic/fake"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 
+	core "github.com/DataDog/datadog-agent/pkg/collector/corechecks"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors/inventory"
 	"github.com/DataDog/datadog-agent/pkg/collector/corechecks/cluster/orchestrator/collectors/k8s"
@@ -800,4 +806,435 @@ func TestFilterCRCollectorsByPermission(t *testing.T) {
 		result := filterCRCollectorsByPermission([]collectors.K8sCollector{}, isForbidden)
 		require.Len(t, result, 0)
 	})
+}
+
+func TestCollectorBundleRetryDiscovery(t *testing.T) {
+	coreGroup := &v1.APIGroup{Name: "", PreferredVersion: v1.GroupVersionForDiscovery{GroupVersion: "v1", Version: "v1"}}
+	appsGroup := &v1.APIGroup{Name: "apps", PreferredVersion: v1.GroupVersionForDiscovery{GroupVersion: "apps/v1", Version: "v1"}}
+	crdGroup := &v1.APIGroup{
+		Name:             "apiextensions.k8s.io",
+		Versions:         []v1.GroupVersionForDiscovery{{GroupVersion: "apiextensions.k8s.io/v1", Version: "v1"}},
+		PreferredVersion: v1.GroupVersionForDiscovery{GroupVersion: "apiextensions.k8s.io/v1", Version: "v1"},
+	}
+	datadogGroup := &v1.APIGroup{
+		Name:             "datadoghq.com",
+		Versions:         []v1.GroupVersionForDiscovery{{GroupVersion: "datadoghq.com/v1alpha1", Version: "v1alpha1"}},
+		PreferredVersion: v1.GroupVersionForDiscovery{GroupVersion: "datadoghq.com/v1alpha1", Version: "v1alpha1"},
+	}
+	nodesResources := &v1.APIResourceList{GroupVersion: "v1", APIResources: []v1.APIResource{{Name: "nodes"}}}
+	coreResources := &v1.APIResourceList{GroupVersion: "v1", APIResources: []v1.APIResource{{Name: "nodes"}, {Name: "services"}}}
+	appsResources := &v1.APIResourceList{GroupVersion: "apps/v1", APIResources: []v1.APIResource{{Name: "deployments"}}}
+	crdResources := &v1.APIResourceList{GroupVersion: "apiextensions.k8s.io/v1", APIResources: []v1.APIResource{{Name: "customresourcedefinitions"}}}
+	datadogResources := &v1.APIResourceList{GroupVersion: "datadoghq.com/v1alpha1", APIResources: []v1.APIResource{{Name: "datadogmetrics"}}}
+
+	failure := retryFetchResult{err: errors.New("client rate limiter Wait returned an error")}
+	appsComplete := retryFetchResult{
+		groups:    []*v1.APIGroup{coreGroup, appsGroup},
+		resources: []*v1.APIResourceList{nodesResources, appsResources},
+	}
+	appsPartial := retryFetchResult{
+		err:       newGroupDiscoveryError(schema.GroupVersion{Group: "apps", Version: "v1"}),
+		groups:    []*v1.APIGroup{coreGroup, appsGroup},
+		resources: []*v1.APIResourceList{nodesResources},
+	}
+	coreComplete := retryFetchResult{
+		groups:    []*v1.APIGroup{coreGroup},
+		resources: []*v1.APIResourceList{coreResources},
+	}
+
+	t.Run("Success - Builtin collectors added after partial failure", func(t *testing.T) {
+		fetch := newRetryFetch(
+			retryFetchResult{
+				err:       newGroupDiscoveryError(schema.GroupVersion{Group: "datadoghq.com", Version: "v1alpha1"}),
+				groups:    []*v1.APIGroup{crdGroup, datadogGroup},
+				resources: []*v1.APIResourceList{crdResources},
+			},
+			retryFetchResult{
+				groups:    []*v1.APIGroup{crdGroup, datadogGroup},
+				resources: []*v1.APIResourceList{crdResources, datadogResources},
+			},
+		)
+		settings := map[string]any{"orchestrator_explorer.custom_resources.ootb.enabled": true}
+		cb := newRetryTestBundle(t, []string{"customresourcedefinitions"}, false, fetch.fetch, settings)
+
+		cb.prepare()
+		require.Equal(t, []string{"apiextensions.k8s.io/v1/customresourcedefinitions"}, collectorNames(cb))
+
+		cb.RetryDiscovery()
+
+		expected := []string{"apiextensions.k8s.io/v1/customresourcedefinitions", "datadoghq.com/v1alpha1/datadogmetrics"}
+		require.Equal(t, expected, collectorNames(cb))
+		require.Equal(t, 2, fetch.calls)
+	})
+	t.Run("Success - Collectors added after partial failure", func(t *testing.T) {
+		fetch := newRetryFetch(appsPartial, appsComplete)
+		cb := newRetryTestBundle(t, []string{"nodes", "deployments"}, false, fetch.fetch, nil)
+
+		cb.prepare()
+		require.Equal(t, []string{"v1/nodes"}, collectorNames(cb))
+		require.Contains(t, warningMessages(cb), "Kubernetes API discovery failed, retrying in 1 runs: "+appsPartial.err.Error())
+		nodesCollector := cb.collectors[0]
+
+		cb.RetryDiscovery()
+
+		require.Equal(t, []string{"v1/nodes", "apps/v1/deployments"}, collectorNames(cb))
+		require.Same(t, nodesCollector, cb.collectors[0])
+		require.Empty(t, warningMessages(cb))
+		require.Equal(t, 2, fetch.calls)
+	})
+	t.Run("Success - Collectors added after total failure", func(t *testing.T) {
+		fetch := newRetryFetch(failure, coreComplete)
+		cb := newRetryTestBundle(t, []string{"nodes", "services"}, false, fetch.fetch, nil)
+
+		cb.prepare()
+		require.Empty(t, collectorNames(cb))
+		require.Equal(t, []string{"Kubernetes API discovery failed, retrying in 1 runs: " + failure.err.Error()}, warningMessages(cb))
+
+		cb.RetryDiscovery()
+
+		require.Equal(t, []string{"v1/nodes", "v1/services"}, collectorNames(cb))
+		require.Empty(t, warningMessages(cb))
+		require.Equal(t, 2, fetch.calls)
+	})
+	t.Run("Success - Discovered collectors added after partial failure", func(t *testing.T) {
+		fetch := newRetryFetch(appsPartial, appsComplete)
+		cb := newRetryTestBundle(t, nil, true, fetch.fetch, nil)
+
+		cb.prepare()
+		require.Equal(t, []string{"clusters", "v1/nodes"}, collectorNames(cb))
+		previous := slices.Clone(cb.collectors)
+
+		cb.RetryDiscovery()
+
+		require.Equal(t, []string{"clusters", "v1/nodes", "apps/v1/deployments"}, collectorNames(cb))
+		require.Same(t, previous[0], cb.collectors[0])
+		require.Same(t, previous[1], cb.collectors[1])
+	})
+	t.Run("Success - No retry for irrelevant partial failure", func(t *testing.T) {
+		fetch := newRetryFetch(retryFetchResult{
+			err:       newGroupDiscoveryError(schema.GroupVersion{Group: "metrics.k8s.io", Version: "v1beta1"}),
+			groups:    []*v1.APIGroup{coreGroup},
+			resources: []*v1.APIResourceList{nodesResources},
+		})
+		cb := newRetryTestBundle(t, []string{"nodes"}, false, fetch.fetch, nil)
+
+		cb.prepare()
+		cb.RetryDiscovery()
+
+		require.Equal(t, []string{"v1/nodes"}, collectorNames(cb))
+		require.Empty(t, warningMessages(cb))
+		require.Equal(t, 1, fetch.calls)
+	})
+	t.Run("Success - No retry when discovery is complete", func(t *testing.T) {
+		fetch := newRetryFetch(coreComplete)
+		cb := newRetryTestBundle(t, []string{"nodes", "services"}, false, fetch.fetch, nil)
+
+		cb.prepare()
+		cb.RetryDiscovery()
+
+		require.Equal(t, []string{"v1/nodes", "v1/services"}, collectorNames(cb))
+		require.Empty(t, warningMessages(cb))
+		require.Equal(t, 1, fetch.calls)
+	})
+	t.Run("Success - Partial failure retried after total failure recovery", func(t *testing.T) {
+		// Fails at configure and on the retries of runs 1, 3, 7, 15 and 31, then partially succeeds on run 63.
+		results := slices.Repeat([]retryFetchResult{failure}, 6)
+		results = append(results, appsPartial, appsComplete)
+		fetch := newRetryFetch(results...)
+		cb := newRetryTestBundle(t, []string{"nodes", "deployments"}, false, fetch.fetch, nil)
+
+		cb.prepare()
+		runRetries(cb, 63)
+		require.Equal(t, []string{"v1/nodes"}, collectorNames(cb))
+		require.Equal(t, 7, fetch.calls)
+
+		cb.RetryDiscovery()
+
+		require.Equal(t, []string{"v1/nodes", "apps/v1/deployments"}, collectorNames(cb))
+		require.Equal(t, 8, fetch.calls)
+	})
+	t.Run("Success - Partial failure retries back off", func(t *testing.T) {
+		fetch := newRetryFetch(appsPartial)
+		cb := newRetryTestBundle(t, []string{"nodes", "deployments"}, false, fetch.fetch, nil)
+
+		cb.prepare()
+		retryRuns := runRetriesTrackingFetches(cb, fetch, 127)
+
+		require.Equal(t, []int{1, 3, 7, 15, 31, 63, 95, 127}, retryRuns)
+		require.Equal(t, []string{"v1/nodes"}, collectorNames(cb))
+		_ = warningMessages(cb)
+
+		cb.RetryDiscovery()
+
+		expected := []string{"Kubernetes API discovery is incomplete, retrying in 31 runs: " + appsPartial.err.Error()}
+		require.Equal(t, expected, warningMessages(cb))
+	})
+	t.Run("Success - Total failure retries back off until recovery", func(t *testing.T) {
+		// Fails at configure and on the retries of runs 1, 3, 7, 15, 31 and 63, then succeeds on run 95.
+		results := slices.Repeat([]retryFetchResult{failure}, 7)
+		results = append(results, coreComplete)
+		fetch := newRetryFetch(results...)
+		cb := newRetryTestBundle(t, nil, true, fetch.fetch, nil)
+		stable := make([]string, 0)
+		for _, collector := range cb.inventory.StableCollectors() {
+			stable = append(stable, collector.Metadata().FullName())
+		}
+
+		cb.prepare()
+		runRetries(cb, 30)
+		require.Empty(t, collectorNames(cb))
+
+		runRetries(cb, 1)
+		require.Equal(t, stable, collectorNames(cb))
+		require.Equal(t, 6, fetch.calls)
+
+		retryRuns := runRetriesTrackingFetches(cb, fetch, 64)
+		require.Equal(t, []int{32, 64}, retryRuns)
+		require.Equal(t, stable, collectorNames(cb))
+
+		runRetries(cb, 64)
+		require.Equal(t, 8, fetch.calls)
+	})
+}
+
+func TestCollectorBundleMergeCollectors(t *testing.T) {
+	newCRCollector := func(resource, groupVersion string) collectors.K8sCollector {
+		collector, err := k8s.NewCRCollectorVersion(resource, groupVersion)
+		require.NoError(t, err)
+		return collector
+	}
+
+	previousWidgetsV1 := newCRCollector("widgets", "example.com/v1")
+	previousWidgetsV2 := newCRCollector("widgets", "example.com/v2")
+	previousSprockets := newCRCollector("sprockets", "example.org/v1")
+	selectedWidgetsV1 := newCRCollector("widgets", "example.com/v1")
+	selectedWidgetsV2 := newCRCollector("widgets", "example.com/v2")
+	selectedGadgets := newCRCollector("gadgets", "example.com/v1")
+
+	cases := []struct {
+		name     string
+		previous []collectors.K8sCollector
+		selected []collectors.K8sCollector
+		expected []collectors.K8sCollector
+	}{
+		{
+			name:     "Success - New collectors added",
+			previous: []collectors.K8sCollector{previousSprockets},
+			selected: []collectors.K8sCollector{selectedGadgets},
+			expected: []collectors.K8sCollector{previousSprockets, selectedGadgets},
+		},
+		{
+			name:     "Success - No previous collector",
+			selected: []collectors.K8sCollector{selectedGadgets},
+			expected: []collectors.K8sCollector{selectedGadgets},
+		},
+		{
+			name:     "Success - Previous collector kept over another version",
+			previous: []collectors.K8sCollector{previousWidgetsV1},
+			selected: []collectors.K8sCollector{selectedWidgetsV2, selectedGadgets},
+			expected: []collectors.K8sCollector{previousWidgetsV1, selectedGadgets},
+		},
+		{
+			name:     "Success - Previous collector kept when not selected",
+			previous: []collectors.K8sCollector{previousSprockets},
+			expected: []collectors.K8sCollector{previousSprockets},
+		},
+		{
+			name:     "Success - Previous versions of a resource kept",
+			previous: []collectors.K8sCollector{previousWidgetsV1, previousWidgetsV2},
+			selected: []collectors.K8sCollector{selectedWidgetsV1, selectedWidgetsV2},
+			expected: []collectors.K8sCollector{previousWidgetsV1, previousWidgetsV2},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cb := CollectorBundle{collectors: tt.selected}
+
+			cb.mergeCollectors(tt.previous)
+
+			require.Len(t, cb.collectors, len(tt.expected))
+			for i, collector := range tt.expected {
+				require.Same(t, collector, cb.collectors[i])
+			}
+		})
+	}
+}
+
+func TestCollectorBundleInitialize(t *testing.T) {
+	cfg := mockconfig.New(t)
+	client := k8sfake.NewClientset()
+	apiClient := &apiserver.APIClient{Cl: client, InformerCl: client}
+	stopCh := make(chan struct{})
+	t.Cleanup(func() { close(stopCh) })
+
+	collectorInventory := inventory.NewCollectorInventory(cfg, nil, nil)
+	newCollector := func(name string) collectors.K8sCollector {
+		collector, err := collectorInventory.CollectorForDefaultVersion(name)
+		require.NoError(t, err)
+		return collector
+	}
+
+	cb := CollectorBundle{
+		collectors:            []collectors.K8sCollector{newCollector("clusters"), newCollector("nodes")},
+		initializedCollectors: map[string]struct{}{},
+		runCfg: &collectors.CollectorRunConfig{
+			K8sCollectorRunConfig: collectors.K8sCollectorRunConfig{
+				APIClient:                   apiClient,
+				OrchestratorInformerFactory: getOrchestratorInformerFactory(apiClient),
+			},
+			Config: &orchcfg.OrchestratorConfig{},
+		},
+		startedInformers: map[cache.SharedInformer]struct{}{},
+		stopCh:           stopCh,
+	}
+
+	cb.Initialize()
+	require.Len(t, cb.startedInformers, 1)
+
+	cb.collectors = append(cb.collectors, newCollector("services"))
+	cb.Initialize()
+
+	expectedInitialized := map[string]struct{}{
+		"clusters":    {},
+		"v1/nodes":    {},
+		"v1/services": {},
+	}
+	require.Equal(t, expectedInitialized, cb.initializedCollectors)
+	require.Len(t, cb.startedInformers, 2)
+}
+
+func TestCollectorBundleResumeSyncedCollectors(t *testing.T) {
+	newBundle := func(t *testing.T) (*CollectorBundle, collectors.K8sCollector) {
+		cfg := mockconfig.New(t)
+		client := k8sfake.NewClientset()
+		apiClient := &apiserver.APIClient{Cl: client, InformerCl: client}
+		runCfg := &collectors.CollectorRunConfig{
+			K8sCollectorRunConfig: collectors.K8sCollectorRunConfig{
+				APIClient:                   apiClient,
+				OrchestratorInformerFactory: getOrchestratorInformerFactory(apiClient),
+			},
+			Config: &orchcfg.OrchestratorConfig{},
+		}
+
+		collector, err := inventory.NewCollectorInventory(cfg, nil, nil).CollectorForDefaultVersion("services")
+		require.NoError(t, err)
+		collector.Init(runCfg)
+		collector.Metadata().IsSkipped = true
+		collector.Metadata().SkippedReason = "couldn't sync informer v1/services"
+
+		return &CollectorBundle{collectors: []collectors.K8sCollector{collector}}, collector
+	}
+
+	t.Run("Success - Synced collector resumed", func(t *testing.T) {
+		cb, collector := newBundle(t)
+		stopCh := make(chan struct{})
+		t.Cleanup(func() { close(stopCh) })
+		go collector.Informer().Run(stopCh)
+
+		resumed := func() bool {
+			cb.resumeSyncedCollectors()
+			return !collector.Metadata().IsSkipped
+		}
+		require.Eventually(t, resumed, 5*time.Second, 10*time.Millisecond)
+		require.Empty(t, collector.Metadata().SkippedReason)
+	})
+	t.Run("Success - Unsynced collector kept skipped", func(t *testing.T) {
+		cb, collector := newBundle(t)
+
+		cb.resumeSyncedCollectors()
+
+		require.True(t, collector.Metadata().IsSkipped)
+		require.Equal(t, "couldn't sync informer v1/services", collector.Metadata().SkippedReason)
+	})
+}
+
+type retryFetch struct {
+	calls   int
+	results []retryFetchResult
+}
+
+// newRetryFetch returns a fetch function returning results in order, the last one being repeated.
+func newRetryFetch(results ...retryFetchResult) *retryFetch {
+	return &retryFetch{results: results}
+}
+
+func (f *retryFetch) fetch() ([]*v1.APIGroup, []*v1.APIResourceList, error) {
+	result := f.results[min(f.calls, len(f.results)-1)]
+	f.calls++
+	return result.groups, result.resources, result.err
+}
+
+type retryFetchResult struct {
+	err       error
+	groups    []*v1.APIGroup
+	resources []*v1.APIResourceList
+}
+
+func collectorNames(cb *CollectorBundle) []string {
+	names := make([]string, 0, len(cb.collectors))
+	for _, collector := range cb.collectors {
+		names = append(names, collector.Metadata().FullName())
+	}
+	return names
+}
+
+func newGroupDiscoveryError(groupVersions ...schema.GroupVersion) error {
+	groups := make(map[schema.GroupVersion]error, len(groupVersions))
+	for _, gv := range groupVersions {
+		groups[gv] = errors.New("service unavailable")
+	}
+	return &k8sdiscovery.ErrGroupDiscoveryFailed{Groups: groups}
+}
+
+func newRetryTestBundle(t *testing.T, configured []string, discoverCollectors bool, fetch discovery.ServerGroupsAndResourcesFunc, settings map[string]any) *CollectorBundle {
+	cfg := mockconfig.New(t)
+	for key, value := range settings {
+		cfg.SetInTest(key, value)
+	}
+
+	return &CollectorBundle{
+		activatedCollectors: map[string]struct{}{},
+		check: &OrchestratorCheck{
+			CheckBase: core.NewCheckBase(CheckName),
+			instance:  &OrchestratorInstance{Collectors: configured},
+		},
+		collectorDiscovery: discovery.NewDiscoveryCollector(fetch),
+		discoverCollectors: discoverCollectors,
+		discoveryRetrier:   newRetrier(discoveryRetryBaseRuns, discoveryRetryMaxRuns),
+		inventory:          inventory.NewCollectorInventory(cfg, nil, nil),
+		runCfg: &collectors.CollectorRunConfig{
+			K8sCollectorRunConfig: collectors.K8sCollectorRunConfig{
+				APIClient: createMockAPIClient(),
+			},
+		},
+	}
+}
+
+func runRetries(cb *CollectorBundle, count int) {
+	for range count {
+		cb.RetryDiscovery()
+	}
+}
+
+// runRetriesTrackingFetches runs count retries and returns the runs, counted from 1, that fetched the discovery.
+func runRetriesTrackingFetches(cb *CollectorBundle, fetch *retryFetch, count int) []int {
+	var runs []int
+	for run := 1; run <= count; run++ {
+		calls := fetch.calls
+		cb.RetryDiscovery()
+		if fetch.calls > calls {
+			runs = append(runs, run)
+		}
+	}
+	return runs
+}
+
+// warningMessages returns the check warnings emitted since the last call.
+func warningMessages(cb *CollectorBundle) []string {
+	warnings := cb.check.GetWarnings()
+	messages := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		messages = append(messages, warning.Error())
+	}
+	return messages
 }

@@ -1,0 +1,16 @@
+# Each section from every release note are combined when the
+# CHANGELOG-DCA.rst is rendered. So the text needs to be worded so that
+# it does not depend on any information only available in another
+# section. This may mean repeating some details, but each section
+# must be readable independently of the other.
+#
+# Each section note must be formatted as reStructuredText.
+---
+fixes:
+  - |
+    The orchestrator check now retries the Kubernetes API discovery on its next runs when it fails entirely, or
+    partially for API groups the check collects, and enables the resource collectors that become available. Retries
+    back off exponentially from the next check run up to about every five minutes until the discovery succeeds.
+    Previously a failed discovery could leave the check running without collecting some or all resources until it
+    was rescheduled. Resource collectors skipped because their resources could not be listed in time also resume
+    once listing succeeds.
